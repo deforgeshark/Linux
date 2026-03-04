@@ -1,0 +1,346 @@
+do_change_pass() {
+  whiptail --msgbox "You will now be asked to enter a new password for the $USER user" 20 60 1
+  passwd $USER &&
+  whiptail --msgbox "Password changed successfully" 20 60 1
+}
+
+get_hostname() {
+  HOSTNAME_FILE="${MOCK_HOSTNAME_FILE:-/etc/hostname}"
+  # skip comments and empty lines, return first valid hostname with whitespace stripped
+  grep -v '^[[:space:]]*\(#\|$\)' "$HOSTNAME_FILE" | head -n1 | xargs
+}
+
+do_hostname() {
+  HOSTNAME_FILE="${MOCK_HOSTNAME_FILE:-/etc/hostname}"
+  HOSTS_FILE="${MOCK_HOSTS_FILE:-/etc/hosts}"
+
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "\
+Please note: RFCs mandate that a hostname's labels \
+may contain only the ASCII letters 'a' through 'z' (case-insensitive),
+the digits '0' through '9', and the hyphen.
+Hostname labels cannot begin or end with a hyphen.
+No other symbols, punctuation characters, or blank spaces are permitted.\
+" 20 70 1
+  fi
+  CURRENT_HOSTNAME=$(get_hostname)
+  if [ "$INTERACTIVE" = True ]; then
+    NEW_HOSTNAME=$(whiptail --inputbox "Please enter a hostname" 20 60 "$CURRENT_HOSTNAME" 3>&1 1>&2 2>&3)
+    RET=$?
+  else
+    NEW_HOSTNAME="$1"
+    RET=0
+  fi
+  if [ $RET -eq 0 ]; then
+    if [ "$INIT" != "systemd" ] || \
+       ! systemctl -q is-active dbus || \
+       ischroot || \
+       ! hostnamectl hostname "$NEW_HOSTNAME" 2> /dev/null; then
+      echo "$NEW_HOSTNAME" > "$HOSTNAME_FILE"
+    fi
+    if [ -f "$HOSTS_FILE" ]; then
+      sed -i "s/^[[:space:]]*127\.0\.1\.1[[:space:]].*/127.0.1.1\t$NEW_HOSTNAME/" "$HOSTS_FILE"
+    fi
+    if [ "$CURRENT_HOSTNAME" != "$NEW_HOSTNAME" ]; then
+      ASK_TO_REBOOT=1
+    fi
+  fi
+}
+get_ssh() {
+  if systemctl -q is-enabled ssh; then
+    echo 0
+  else
+    echo 1
+  fi
+}
+
+do_ssh() {
+  DEFAULT=--defaultno
+  if [ "$(get_ssh)" -eq 0 ]; then
+    DEFAULT=
+  fi
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --yesno \
+      "Would you like the SSH server to be enabled?\n\nCaution: Default and weak passwords are a security risk when SSH is enabled!" \
+      $DEFAULT 20 60 2
+    RET=$?
+  else
+    RET=$1
+  fi
+  if [ "$RET" -eq 0 ]; then
+    ssh-keygen -A &&
+    update-rc.d ssh enable &&
+    invoke-rc.d ssh start &&
+    STATUS=enabled
+  elif [ "$RET" -eq 1 ]; then
+    update-rc.d ssh disable &&
+    invoke-rc.d ssh stop &&
+    STATUS=disabled
+  else
+    return "$RET"
+  fi
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "The SSH server is $STATUS" 20 60 1
+  fi
+}
+
+get_vnc() {
+  if is_wayland; then
+    if systemctl status wayvnc.service | grep -q -w active; then
+      echo 0
+    else
+      echo 1
+    fi
+  else
+    if systemctl status vncserver-x11-serviced.service | grep -q -w active; then
+      echo 0
+    else
+      echo 1
+    fi
+  fi
+}
+
+do_vnc() {
+  DEFAULT=--defaultno
+  if [ $(get_vnc) -eq 0 ]; then
+    DEFAULT=
+  fi
+  APT_GET_FLAGS=""
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --yesno "Would you like the VNC Server to be enabled?" $DEFAULT 20 60 2
+    RET=$?
+  else
+    RET=$1
+    APT_GET_FLAGS="-y"
+  fi
+  if [ $RET -eq 0 ]; then
+    if is_installed wayvnc; then
+      wayvnc_version="$(get_package_version wayvnc)"
+      if dpkg --compare-versions "$wayvnc_version" lt 0.8; then
+        whiptail --msgbox "WayVNC version 0.8 or greater is required (have $wayvnc_version)" 20 60 1
+        return 1
+      fi
+
+      systemctl stop wayvnc.service
+
+      # In case wayvnc is already running via older xdg-autostart machanism
+      if [ -e /etc/xdg/autostart/wayvnc.desktop ] ; then
+        rm /etc/xdg/autostart/wayvnc.desktop
+      fi
+    fi
+    if is_installed realvnc-vnc-server; then
+      systemctl disable vncserver-x11-serviced.service
+      systemctl stop vncserver-x11-serviced.service
+    fi
+    if is_wayland; then
+      if is_installed wayvnc; then
+        systemctl enable wayvnc.service &&
+        systemctl start wayvnc.service &&
+        STATUS=enabled
+      else
+        return 1
+      fi
+    else
+      if is_installed realvnc-vnc-server || apt-get install "$APT_GET_FLAGS" realvnc-vnc-server; then
+        systemctl enable vncserver-x11-serviced.service &&
+        systemctl start vncserver-x11-serviced.service &&
+        STATUS=enabled
+      else
+        return 1
+      fi
+    fi
+  elif [ $RET -eq 1 ]; then
+    if is_installed wayvnc; then
+      systemctl disable wayvnc.service
+      systemctl stop wayvnc.service
+    fi
+    if is_installed realvnc-vnc-server; then
+      systemctl disable vncserver-x11-serviced.service
+      systemctl stop vncserver-x11-serviced.service
+    fi
+    STATUS=disabled
+  else
+    return $RET
+  fi
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "The VNC Server is $STATUS" 20 60 1
+  fi
+}
+
+get_rpi_connect() {
+  PREFIX=""
+  if [ -n "$SUDO_USER" ] ; then
+    PREFIX="sudo -u $USER XDG_RUNTIME_DIR=/run/user/$SUDO_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$SUDO_UID/bus "
+  fi
+  if $PREFIX systemctl --user -q status rpi-connect.service | grep -q -w active; then
+    echo 0
+  else
+    echo 1
+  fi
+}
+
+do_rpi_connect() {
+  PREFIX=""
+  if [ -n "$SUDO_USER" ] ; then
+    PREFIX="sudo -u $USER XDG_RUNTIME_DIR=/run/user/$SUDO_UID DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$SUDO_UID/bus "
+  fi
+  APT_GET_FLAGS=""
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --yesno "Would you like to enable screen sharing over Raspberry Pi Connect?" --defaultno 20 60 2
+    RET=$?
+  else
+    APT_GET_FLAGS="-y"
+    RET=$1
+  fi
+  rpi_connect_version="$(get_package_version rpi-connect)"
+  if [ $RET -eq 0 ]; then
+    if is_installed rpi-connect || apt-get install "$APT_GET_FLAGS" rpi-connect; then
+      if dpkg --compare-versions "$rpi_connect_version" lt 1.3; then
+        $PREFIX systemctl --user -q enable rpi-connect.service rpi-connect-wayvnc.service
+        $PREFIX systemctl --user -q start rpi-connect.service rpi-connect-wayvnc.service
+      elif dpkg --compare-versions "$rpi_connect_version" lt 2.0; then
+        $PREFIX systemctl --user -q enable rpi-connect.service rpi-connect-wayvnc.service rpi-connect-wayvnc-watcher.path
+        $PREFIX systemctl --user -q start rpi-connect.service
+      else
+        $PREFIX rpi-connect on > /dev/null 2>&1
+      fi
+      STATUS="Screen sharing via Raspberry Pi Connect is enabled"
+    else
+      return 1
+    fi
+  elif [ $RET -eq 1 ]; then
+    if [ "$INTERACTIVE" = True ]; then
+      whiptail --yesno "Would you like to enable remote shell access over Raspberry Pi Connect?" --defaultno 20 60 2
+      RET=$?
+    fi
+    if [ $RET -eq 0 ]; then
+      if is_installed rpi-connect || is_installed rpi-connect-lite || apt-get install "$APT_GET_FLAGS" rpi-connect-lite; then
+        if dpkg --compare-versions "$rpi_connect_version" lt 2.0; then
+          $PREFIX systemctl --user -q enable rpi-connect.service
+          $PREFIX systemctl --user -q start rpi-connect.service
+        else
+          $PREFIX rpi-connect on > /dev/null 2>&1
+        fi
+        STATUS="Remote shell access via Raspberry Pi Connect is enabled"
+      else
+        return 1
+      fi
+    elif [ $RET -eq 1 ]; then
+      if dpkg --compare-versions "$rpi_connect_version" lt 1.3; then
+        $PREFIX systemctl --user -q stop rpi-connect.service rpi-connect-wayvnc.service
+        $PREFIX systemctl --user -q disable rpi-connect-wayvnc.service rpi-connect.service
+      elif dpkg --compare-versions "$rpi_connect_version" lt 2.0; then
+        $PREFIX systemctl --user -q stop rpi-connect.service
+        $PREFIX systemctl --user -q disable rpi-connect.service rpi-connect-wayvnc.service rpi-connect-wayvnc-watcher.path
+      else
+        $PREFIX rpi-connect off > /dev/null 2>&1
+      fi
+      STATUS="Raspberry Pi Connect is disabled"
+    else
+      return $RET
+    fi
+  else
+    return $RET
+  fi
+  if [ "$INTERACTIVE" = True ]; then
+    whiptail --msgbox "$STATUS" 20 60 1
+  fi
+}
+get_browser() {
+  echo $(update-alternatives --display x-www-browser | grep currently | cut -d " " -f 7 | cut -d / -f 4)
+}
+
+do_browser() {
+  if [ "$INTERACTIVE" = True ]; then
+    RES=$(whiptail --title "Raspberry Pi Software Configuration Tool (raspi-config)" --menu "Select Browser" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT \
+      "1" "Chromium" \
+      "2" "Firefox" \
+      3>&1 1>&2 2>&3)
+  else
+    RES=""
+    BROWSER=$1
+    true
+  fi
+  if [ $? -eq 0 ]; then
+    if [ "$RES" = "1" ] ; then
+      BROWSER="chromium"
+      BSTRING="Chromium"
+    elif [ "$RES" = "2" ] ; then
+      BROWSER="firefox"
+      BSTRING="Firefox"
+    fi
+    update-alternatives --set x-www-browser /usr/bin/$BROWSER > /dev/null
+    if [ -z $2 ] ; then
+      sudo -u $USER xdg-settings set default-web-browser $BROWSER.desktop
+    else
+      sudo -u $2 xdg-settings set default-web-browser $BROWSER.desktop
+    fi
+    if [ "$INTERACTIVE" = True ]; then
+      whiptail --msgbox "Default browser set to $BSTRING" 20 60 1
+    fi
+  fi
+}
+get_vnc_resolution() {
+  if is_wayfire ; then
+    W=$(grep ^headless_width $WAYFIRE_FILE | grep -o "[0-9]*")
+    H=$(grep ^headless_height $WAYFIRE_FILE | grep -o "[0-9]*")
+    if [ -n "$W" ] && [ -n "$H" ] ; then
+      echo $W"x"$H
+    else
+      echo "1280x720"
+    fi
+  else
+    if [ -e /etc/xdg/autostart/vnc_xrandr.desktop ] ; then
+      grep fb /etc/xdg/autostart/vnc_xrandr.desktop | cut -f 15 -d ' '
+    else
+      echo ""
+    fi
+  fi
+}
+
+do_vnc_resolution() {
+  if [ "$INTERACTIVE" = True ]; then
+    CUR=$(get_vnc_resolution)
+    if [ "$CUR" = "" ] ; then
+      CUR=640x480
+    fi
+    FUN=$(whiptail --title "Raspberry Pi Software Configuration Tool (raspi-config)" --default-item $CUR --menu "Set VNC Resolution" $WT_HEIGHT $WT_WIDTH $WT_MENU_HEIGHT --cancel-button Back --ok-button Select \
+      "640x480" "" "720x480" "" "800x600" "" "1024x768" "" "1280x720" "" "1280x1024" "" "1600x1200" "" "1920x1080" "" 3>&1 1>&2 2>&3)
+    RET=$?
+  else
+    FUN=$1
+    RET=0
+  fi
+  if [ $RET -eq 1 ]; then
+    return 0
+  elif [ $RET -eq 0 ]; then
+    if is_wayfire ; then
+      W=$(echo "$FUN" | cut -d x -f 1)
+      H=$(echo "$FUN" | cut -d x -f 2)
+      if grep -q ^headless_width $WAYFIRE_FILE ; then
+        sed -i "s/headless_width.*/headless_width = $W/" $WAYFIRE_FILE
+        sed -i "s/headless_height.*/headless_height = $H/" $WAYFIRE_FILE
+      else
+        if grep -q "\[output\]" $WAYFIRE_FILE ; then
+          sed -i "s/\[output]/[output]\nheadless_width = $W\nheadless_height = $H/" $WAYFIRE_FILE
+        else
+          printf '\n[output]\nheadless_width = %d\nheadless_height = %d\n' "$W" "$H" >> $WAYFIRE_FILE
+        fi
+      fi
+    else
+      cat > /etc/xdg/autostart/vnc_xrandr.desktop << EOF
+[Desktop Entry]
+Type=Application
+Name=vnc_xrandr
+Comment=Set resolution for VNC
+NoDisplay=true
+Exec=sh -c "if ! (xrandr | grep -q -w connected) ; then /usr/bin/xrandr --fb $FUN ; fi"
+EOF
+    fi
+    if [ "$INTERACTIVE" = True ]; then
+      whiptail --msgbox "The resolution is set to $FUN" 20 60 1
+      ASK_TO_REBOOT=1
+    fi
+  fi
+}
+
